@@ -1,6 +1,6 @@
 ﻿{
   "Author": "Infi yimo",
-  "Description": "简单实用的日历插件\n- 在服务器栏中显示当前活动\n- 浏览当前、即将到来和过往的活动\n- 重要日期高亮显示",
+  "Description": "在服务器栏中显示当前进行中的国服FFXIV活动\n- 从官方活动中心获取节庆活动数据\n- 服务器栏入口点击直达设置页面\n- 支持标记活动为已完成",
   "InternalName": "EventyCN",
   "Punchline": "再也不忘记任何季节活动",
   "Name": "EventyCN",

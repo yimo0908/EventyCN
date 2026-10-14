@@ -101,6 +101,6 @@ public class ServerBar
 
     private void OnClick(DtrInteractionEvent data)
     {
-        Plugin.OpenMain();
+        Plugin.OpenConfig();
     }
 }

@@ -1,4 +1,5 @@
 using System.Collections.Frozen;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Dalamud.Interface.Windowing;
@@ -8,7 +9,6 @@ using Dalamud.Plugin.Services;
 using EventyCN.Attributes;
 using EventyCN.Windows;
 using EventyCN.Windows.Config;
-using EventyCN.Windows.Main;
 using Newtonsoft.Json;
 
 namespace EventyCN;
@@ -26,24 +26,36 @@ public class Plugin : IDalamudPlugin
 
     public readonly WindowSystem WindowSystem = new("EventyCN");
     public ConfigWindow ConfigWindow { get; init; }
-    public MainWindow MainWindow { get; init; }
 
     private readonly PluginCommandManager<Plugin> CommandManager;
     public readonly ServerBar ServerBar;
 
     public FrozenDictionary<long, ParsedEvent[]> Events = FrozenDictionary<long, ParsedEvent[]>.Empty;
 
-    private readonly HashSet<(int Year, int Month)> _loadedMonths = [];
+    private int _loaded;
     private readonly object _loadLock = new();
+
+    /// <summary>
+    /// 预定义颜色池，为新数据源缺少颜色字段的活动自动分配颜色。
+    /// </summary>
+    private static readonly uint[] ColorPool =
+    [
+        Helper.HexToUint("#4CAF50"),
+        Helper.HexToUint("#2196F3"),
+        Helper.HexToUint("#9C27B0"),
+        Helper.HexToUint("#FF9800"),
+        Helper.HexToUint("#E91E63"),
+        Helper.HexToUint("#FFC107"),
+        Helper.HexToUint("#F44336"),
+        Helper.HexToUint("#FFEB3B"),
+    ];
 
     public Plugin()
     {
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
-        MainWindow = new MainWindow(this);
         ConfigWindow = new ConfigWindow(this);
 
-        WindowSystem.AddWindow(MainWindow);
         WindowSystem.AddWindow(ConfigWindow);
 
         CommandManager = new PluginCommandManager<Plugin>(this, Commands);
@@ -51,21 +63,13 @@ public class Plugin : IDalamudPlugin
 
         PluginInterface.UiBuilder.Draw += DrawUi;
         PluginInterface.UiBuilder.OpenConfigUi += OpenConfig;
-        PluginInterface.UiBuilder.OpenMainUi += OpenMain;
 
         Task.Run(async () => await LoadEvents());
     }
 
     [Command("/eventycn")]
-    [HelpMessage("打开活动日历")]
+    [HelpMessage("打开插件设置")]
     public void OpenMainCommand(string _, string __)
-    {
-        MainWindow.Toggle();
-    }
-
-    [Command("/eventycnconf")]
-    [HelpMessage("打开活动日历设置")]
-    public void OpenSettingsCommand(string _, string __)
     {
         ConfigWindow.Toggle();
     }
@@ -77,49 +81,43 @@ public class Plugin : IDalamudPlugin
         WindowSystem.RemoveAllWindows();
 
         ConfigWindow.Dispose();
-        MainWindow.Dispose();
 
         PluginInterface.UiBuilder.Draw -= DrawUi;
         PluginInterface.UiBuilder.OpenConfigUi -= OpenConfig;
-        PluginInterface.UiBuilder.OpenMainUi -= OpenMain;
 
         CommandManager.Dispose();
         ServerBar.Dispose();
     }
 
     /// <summary>
-    /// 初始化加载：请求当前月 ± 2 月，共 5 个月的数据
+    /// 初始化加载：一次性拉取活动中心节庆列的全部活动数据。
     /// </summary>
     private async Task LoadEvents()
     {
-        var now = DateTime.Now;
-        for (var offset = -2; offset <= 2; offset++)
-        {
-            var d = now.AddMonths(offset);
-            await EnsureMonthLoaded(d.Year, d.Month);
-        }
+        await EnsureEventsLoaded();
     }
 
     /// <summary>
-    /// 确保指定月份的数据已加载，如果尚未加载则请求 API
+    /// 确保活动数据已加载。新数据源一次性返回全部活动（不按月分页），
+    /// 因此只需加载一次。
     /// </summary>
-    public async Task EnsureMonthLoaded(int year, int month)
+    public async Task EnsureEventsLoaded()
     {
         lock (_loadLock)
         {
-            if (_loadedMonths.Contains((year, month)))
+            if (_loaded != 0)
                 return;
-            _loadedMonths.Add((year, month));
+            _loaded = 1;
         }
 
-        var json = await Updater.GetEventsCn(year, month);
+        var json = await Updater.GetEventsCn();
         if (string.IsNullOrEmpty(json))
             return;
 
-        CnApiResponse? resp;
+        ActiveCenterResponse? resp;
         try
         {
-            resp = JsonConvert.DeserializeObject<CnApiResponse>(json);
+            resp = JsonConvert.DeserializeObject<ActiveCenterResponse>(json);
         }
         catch (Exception ex)
         {
@@ -127,46 +125,41 @@ public class Plugin : IDalamudPlugin
             return;
         }
 
-        if (resp?.Code != 10000 || resp.Data == null)
+        if (resp?.Code != "0" || resp.Data == null)
             return;
 
-        // 过滤掉 type == 1（版本类）的事件
-        var events = resp.Data.Where(e => e.Type != 1).OrderBy(e => e.BeginTime).ToArray();
+        var events = resp.Data.OrderBy(e => e.SortIndex).ToArray();
         if (events.Length == 0)
             return;
 
         lock (_loadLock)
         {
-            // 将当前 Events 转为可修改的字典
-            var dict = new Dictionary<long, ParsedEvent[]>(Events);
-
-            // 收集所有已存在的事件 ID，避免跨月活动重复添加
+            var dict = new Dictionary<long, ParsedEvent[]>();
             var existingIds = new HashSet<long>();
-            foreach (var arr in dict.Values)
-            {
-                foreach (var e in arr)
-                    existingIds.Add(e.Id);
-            }
 
-            foreach (var ev in events)
+            for (var i = 0; i < events.Length; i++)
             {
-                // 如果该事件已经被前一个月的数据添加过，跳过
+                var ev = events[i];
+
                 if (existingIds.Contains(ev.Id))
                     continue;
 
-                var begin = DateTimeOffset.FromUnixTimeSeconds(ev.BeginTime).LocalDateTime;
-                var end = DateTimeOffset.FromUnixTimeSeconds(ev.EndTime).LocalDateTime;
+                if (!TryParseEventTime(ev.Summary, out var begin, out var end))
+                {
+                    Log.Warning($"无法解析活动时间：{ev.Title} - {ev.Summary}");
+                    continue;
+                }
 
-                var color = Helper.HexToUint(ev.Color);
-                var opacity = Helper.HexToUint(ev.Color, 0.5f);
+                var color = ColorPool[i % ColorPool.Length];
+                var opacity = color & 0x00FFFFFF | ((uint)(0.5f * 255) << 24);
 
                 var eventDay = new ParsedEvent
                 {
                     Id = ev.Id,
-                    Name = ev.Name,
+                    Name = ev.Title,
                     Begin = begin,
                     End = end,
-                    Url = ev.Url,
+                    Url = ev.OutLink,
                     Color = color,
                     Opacity = opacity,
                     Spacing = 17.0f
@@ -203,56 +196,96 @@ public class Plugin : IDalamudPlugin
         ServerBar.Refresh();
     }
 
+    /// <summary>
+    /// 从 Summary 字段中解析活动时间。
+    /// 支持格式：活动时间：2026年10月7日16:00～2026年10月27日22:59
+    /// 分隔符可以是 ～、~、-、— 等。
+    /// </summary>
+    private static readonly Regex EventTimeRegex = new(
+        @"活动时间[：:]\s*(\d{4}年\d{1,2}月\d{1,2}日\s*\d{1,2}:\d{2})\s*[～~\-—–]\s*(\d{4}年\d{1,2}月\d{1,2}日\s*\d{1,2}:\d{2})",
+        RegexOptions.Compiled);
+
+    private static bool TryParseEventTime(string? summary, out DateTime begin, out DateTime end)
+    {
+        begin = DateTime.UnixEpoch;
+        end = DateTime.UnixEpoch;
+
+        if (string.IsNullOrEmpty(summary))
+            return false;
+
+        var match = EventTimeRegex.Match(summary);
+        if (!match.Success)
+            return false;
+
+        if (!TryParseCnDateTime(match.Groups[1].Value, out begin))
+            return false;
+
+        if (!TryParseCnDateTime(match.Groups[2].Value, out end))
+            return false;
+
+        return true;
+    }
+
+    /// <summary>
+    /// 解析中文日期时间格式，如 "2026年10月7日16:00" 或 "2026年10月7日 16:00"。
+    /// </summary>
+    private static bool TryParseCnDateTime(string input, out DateTime result)
+    {
+        const string format1 = "yyyy年M月d日HH:mm";
+        const string format2 = "yyyy年M月d日 HH:mm";
+
+        input = input.Trim();
+
+        if (DateTime.TryParseExact(input, format1, null, System.Globalization.DateTimeStyles.None, out result))
+            return true;
+
+        if (DateTime.TryParseExact(input, format2, null, System.Globalization.DateTimeStyles.None, out result))
+            return true;
+
+        return DateTime.TryParseExact(input, "yyyy年M月d日 H:mm", null, System.Globalization.DateTimeStyles.None, out result);
+    }
+
     private void DrawUi() => WindowSystem.Draw();
-    public void OpenMain() => MainWindow.Toggle();
     public void OpenConfig() => ConfigWindow.Toggle();
 }
 
-public class CnApiResponse
+public class ActiveCenterResponse
 {
-    [JsonProperty("code")]
-    public int Code;
+    [JsonProperty("Code")]
+    public string Code = "";
 
-    [JsonProperty("msg")]
-    public string Msg = "";
+    [JsonProperty("Message")]
+    public string Message = "";
 
-    [JsonProperty("data")]
-    public CnEvent[] Data = [];
+    [JsonProperty("Data")]
+    public ActiveCenterEvent[] Data = [];
 }
 
-public class CnEvent
+public class ActiveCenterEvent
 {
-    [JsonProperty("id")]
+    [JsonProperty("Id")]
     public long Id;
 
-    [JsonProperty("name")]
-    public string Name = "";
+    [JsonProperty("Title")]
+    public string Title = "";
 
-    [JsonProperty("url")]
-    public string Url = "";
+    [JsonProperty("Summary")]
+    public string Summary = "";
 
-    [JsonProperty("begin_time")]
-    public long BeginTime;
+    [JsonProperty("OutLink")]
+    public string OutLink = "";
 
-    [JsonProperty("end_time")]
-    public long EndTime;
+    [JsonProperty("HomeImagePath")]
+    public string HomeImagePath = "";
 
-    [JsonProperty("color")]
-    public string Color = "";
+    [JsonProperty("PublishDate")]
+    public string PublishDate = "";
 
-    [JsonProperty("type")]
-    public int Type;
+    [JsonProperty("SortIndex")]
+    public int SortIndex;
 
-    [JsonProperty("weight")]
-    public int Weight;
-
-    [JsonProperty("daoyu_sw")]
-    public int DaoyuSw;
-
-    [JsonProperty("banner_url")]
-    public string? BannerUrl;
-
-    public CnEvent() {}
+    [JsonProperty("CategoryCode")]
+    public int CategoryCode;
 }
 
 public struct ParsedEvent

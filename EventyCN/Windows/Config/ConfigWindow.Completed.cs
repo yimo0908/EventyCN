@@ -32,7 +32,13 @@ public partial class ConfigWindow
         foreach (var ev in events)
         {
             ImGui.TableNextColumn();
-            Helper.TextWrapped(ev.Name);
+            ImGui.Selectable(ev.Name);
+            if (ImGui.IsItemHovered() && ev.Url != "")
+            {
+                ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+                if (ImGui.IsItemClicked())
+                    Utils.OpenUrl(ev.Url);
+            }
 
             ImGui.TableNextColumn();
             var pos = ImGui.GetCursorPos();
